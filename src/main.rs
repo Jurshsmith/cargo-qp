@@ -1,7 +1,15 @@
-//! cargo-clip — copy Rust source & Cargo.toml files to the clipboard.
-//! • Default: every *.rs *and* every tracked/untracked Cargo.toml
-//! • Obeys .gitignore so ignored artefacts never leak
-//! • Works for workspaces and single-crate repos (crate name + version header)
+//! cargo-qp — copies every Rust source file *and* every Cargo.toml that
+//! is **not** ignored by `.gitignore` into the system clipboard (or stdout).
+//!
+//! Key points
+//! ----------
+//! • Walks the work-tree with `ignore::WalkBuilder`, which obeys .gitignore but
+//!   still visits *un-tracked* files.
+//! • Treats `rs` + `toml` as the built-in default extension set.
+//! • Finds the owning crate for each file via cargo-metadata; when a file lives
+//!   outside the workspace graph we parse the nearest Cargo.toml.
+//! • Adds `crate-name v<version>` headers so LLMs understand context.
+//! • Cross-platform clipboard through `arboard` (Wayland, X11, macOS, Win32).
 
 use std::{
     collections::HashMap,
@@ -10,103 +18,123 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use arboard::Clipboard; // cross-platform clipboard :contentReference[oaicite:1]{index=1}
+use arboard::Clipboard;
 use cargo_metadata::MetadataCommand;
-use cargo_toml::{Inheritable, Manifest}; // to parse standalone manifests
+use cargo_toml::{Inheritable, Manifest};
 use clap::{Parser, ValueHint};
-use git2::{Repository, StatusOptions}; // libgit2 bindings :contentReference[oaicite:2]{index=2}
+use ignore::{DirEntry, WalkBuilder};
 
+/// map: crate-root → (name, version)
 type CrateMap = HashMap<PathBuf, (String, String)>;
 
-/// `cargo clip [OPTIONS] [ext …]`
+/// Commander-line interface
 #[derive(Parser)]
-#[command(name = "cargo-clip", version, about)]
+#[command(name = "cargo-qp", version, about)]
 struct Opts {
-    /// Workspace or crate root (defaults to cwd)
+    /// Path to repo / workspace root
     #[arg(short, long, value_hint = ValueHint::DirPath, default_value = ".")]
     dir: PathBuf,
 
-    /// Extra extensions to include (default: rs toml)
+    /// Extra extensions (space-separated).  Defaults to: rs toml
     exts: Vec<String>,
 
-    /// Print to stdout instead of the clipboard
+    /// Write to stdout instead of the clipboard
     #[arg(long)]
     no_clipboard: bool,
 }
 
 fn main() -> Result<()> {
     let opts = Opts::parse();
-    let extensions = if opts.exts.is_empty() {
+    let exts: Vec<String> = if opts.exts.is_empty() {
         vec!["rs".into(), "toml".into()]
     } else {
         opts.exts.clone()
     };
 
-    // 1️⃣  collect crate metadata
-    let crates = build_crate_map(&opts.dir)?;
+    //---------------- 1  Build crate map ------------------------------------
+    let crates = crate_map(&opts.dir)?;
 
-    // 2️⃣  enumerate git *and* untracked files (obey .gitignore)
-    let repo = Repository::discover(&opts.dir).context("not a git repository")?;
-    let statuses = repo.statuses(Some(
-        StatusOptions::new()
-            .include_untracked(true) // ← always include untracked files
-            .include_ignored(false) // but still skip ignored
-            .include_unmodified(true),
-    ))?;
+    //---------------- 2  Walk work-tree (git-aware) --------------------------
+    let mut wanted: Vec<PathBuf> = Vec::new();
 
-    let mut wanted = Vec::<PathBuf>::new();
-    for st in statuses.iter() {
-        if let Some(p) = st.path() {
-            let abs = opts.dir.join(p);
-            if abs.file_name() == Some("Cargo.toml".as_ref()) {
-                wanted.push(abs);
+    let mut builder = WalkBuilder::new(&opts.dir);
+    builder
+        .hidden(false) // still heed .gitignore, but allow dotfiles
+        .parents(true) // read .gitignore files in parents
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .filter_entry(|e| filter_entry(e));
+
+    for result in builder.build() {
+        let dent = match result {
+            Ok(d) => d,
+            Err(err) => {
+                eprintln!("Walk error: {err}");
                 continue;
             }
-            if abs
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| extensions.iter().any(|x| x == e))
-                .unwrap_or(false)
-            {
-                wanted.push(abs);
+        };
+
+        if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+
+        let path = dent.into_path();
+
+        // Always include any Cargo.toml
+        if path.file_name() == Some("Cargo.toml".as_ref()) {
+            wanted.push(path);
+            continue;
+        }
+
+        // Otherwise gate by extension list
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if exts.iter().any(|x| x == ext) {
+                wanted.push(path);
             }
         }
     }
+
     wanted.sort();
 
-    // 3️⃣  compose prompt text
+    //---------------- 3  Compose output --------------------------------------
     let mut out = String::new();
+
     for path in &wanted {
-        let (name, ver) =
+        let (name, version) =
             crate_for_path(path, &crates).unwrap_or_else(|| ("unknown_crate".into(), "?".into()));
+
         let rel = path.strip_prefix(&opts.dir).unwrap_or(path);
-        out.push_str(&format!("=== {name} v{ver} :: {} ===\n", rel.display()));
-        out.push_str(&fs::read_to_string(path)?);
+
+        out.push_str(&format!("=== {name} v{version} :: {} ===\n", rel.display()));
+        out.push_str(
+            &fs::read_to_string(path).with_context(|| format!("reading {}", rel.display()))?,
+        );
         out.push('\n');
     }
 
-    // 4️⃣  clipboard or stdout
+    //---------------- 4  Clipboard or stdout ---------------------------------
     if opts.no_clipboard {
         print!("{out}");
     } else {
         match Clipboard::new() {
-            // Wayland / X11 / macOS / Windows :contentReference[oaicite:3]{index=3}
-            Ok(mut c) => c.set_text(out.clone())?,
+            Ok(mut clip) => clip.set_text(out.clone())?,
             Err(e) => {
-                eprintln!("clipboard error ({e}); printing");
+                eprintln!("clipboard unavailable ({e}); printing to stdout");
                 print!("{out}");
             }
         }
     }
+
     Ok(())
 }
 
-//──────────────────────── helpers ────────────────────────────────────────────
+//-----------------------------------------------------------------------------
 
-fn build_crate_map(root: &Path) -> Result<CrateMap> {
+fn crate_map(root: &Path) -> Result<CrateMap> {
     let mut map = CrateMap::new();
 
-    // workspace members via `cargo metadata`
+    // a) any workspace crates
     if let Ok(md) = MetadataCommand::new()
         .manifest_path(root.join("Cargo.toml"))
         .exec()
@@ -122,18 +150,19 @@ fn build_crate_map(root: &Path) -> Result<CrateMap> {
         }
     }
 
-    // standalone repo fallback
+    // b) still add the root crate when not part of workspace
     let root_manifest = root.join("Cargo.toml");
     if !map.contains_key(root) && root_manifest.exists() {
-        let mani: Manifest = Manifest::from_path(&root_manifest)?;
-        if let Some(pkg) = mani.package {
-            map.insert(root.to_path_buf(), (pkg.name, fmt_ver(&pkg.version)));
+        if let Ok(mani) = Manifest::from_path(&root_manifest) {
+            if let Some(pkg) = mani.package {
+                map.insert(root.to_path_buf(), (pkg.name, fmt_ver(&pkg.version)));
+            }
         }
     }
     Ok(map)
 }
 
-/// stringify `Inheritable<String>` (covers all crate versions of cargo_toml)
+/// stringify `Inheritable<String>` (workspace-inherited or explicit)
 fn fmt_ver(v: &Inheritable<String>) -> String {
     match v {
         Inheritable::Set(s) => s.clone(),
@@ -141,18 +170,21 @@ fn fmt_ver(v: &Inheritable<String>) -> String {
     }
 }
 
+/// find owning crate for *path*
+/// (longest-prefix match against crate roots; else parse nearest Cargo.toml)
 fn crate_for_path(p: &Path, crates: &CrateMap) -> Option<(String, String)> {
     crates
         .iter()
         .filter(|(root, _)| p.starts_with(root))
         .max_by_key(|(root, _)| root.components().count())
-        .map(|(_, v)| v.clone())
+        .map(|(_, pair)| pair.clone())
         .or_else(|| {
+            // fallback: climb upward until a manifest is found
             let mut cur = p.parent();
             while let Some(dir) = cur {
-                let mani = dir.join("Cargo.toml");
-                if mani.exists() {
-                    if let Ok(m) = Manifest::from_path(&mani) {
+                let mani_path = dir.join("Cargo.toml");
+                if mani_path.exists() {
+                    if let Ok(m) = Manifest::from_path(&mani_path) {
                         if let Some(pkg) = m.package {
                             return Some((pkg.name, fmt_ver(&pkg.version)));
                         }
@@ -162,4 +194,16 @@ fn crate_for_path(p: &Path, crates: &CrateMap) -> Option<(String, String)> {
             }
             None
         })
+}
+
+/// Custom walker filter: skip really big vendor dirs
+fn filter_entry(e: &DirEntry) -> bool {
+    if let Some(name) = e.file_name().to_str() {
+        // Prevent massive dump
+        const SKIP: &[&str] = &["target", ".git", "node_modules"];
+        if SKIP.iter().any(|d| d == &name) {
+            return false;
+        }
+    }
+    true
 }
