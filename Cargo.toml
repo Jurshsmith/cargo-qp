@@ -1,6 +1,6 @@
 [package]
 name = "cargo-qp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Copy Rust sources & Cargo.toml files to the clipboard (workspace-aware)"
 license = "MIT OR Apache-2.0"
