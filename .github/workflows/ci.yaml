@@ -1,0 +1,10 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1  # installs & caches toolchain :contentReference[oaicite:8]{index=8}
+      - run: cargo test --all-features
+      - run: cargo clippy -- -D warnings

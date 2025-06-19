@@ -1,0 +1,23 @@
+[package]
+name = "cargo-qp"
+version = "0.1.0"
+edition = "2021"
+authors = ["AJ <aj@synarktech.com"]
+description = "Copy Rust workspace source + Cargo.toml files to the clipboard"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jurshsmith/cargo-qp"
+readme = "README.md"
+keywords = ["clipboard", "cargo-subcommand", "rust"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "cargo-qp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+cargo_metadata = "0.18"
+git2 = "0.18"
+ignore = "0.4"
+arboard = "3"
